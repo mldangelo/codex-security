@@ -31,16 +31,7 @@ const SEVERITY_COLORS: Record<string, number> = {
   INFORMATIONAL: 37,
 };
 
-// Severity badges occupy a fixed column, so the widest label decides the width
-// and the finding indent that lines up under it. INFORMATIONAL is abbreviated to
-// keep that column narrow; spelling it out costs every finding title five
-// characters, which matters most at the 48-column minimum.
-const SEVERITY_LABELS: Record<string, string> = { INFORMATIONAL: "INFO" };
-const SEVERITY_BADGE_WIDTH = Math.max(
-  ...Object.keys(SEVERITY_COLORS).map(
-    (severity) => (SEVERITY_LABELS[severity] ?? severity).length,
-  ),
-);
+const SEVERITY_BADGE_WIDTH = 8;
 const FINDING_INDENT = 4 + SEVERITY_BADGE_WIDTH + 2;
 
 const KNOWN_SINCE_DATE = new Intl.DateTimeFormat("en-US", {
@@ -109,8 +100,9 @@ export function renderScanHistory(
   const finding = (entry: JsonObject, includeReason = true): void => {
     const severity = findingSeverity(entry);
     const title = clean(entry["title"]);
+    const label = severity === "INFORMATIONAL" ? "INFO" : severity;
     const badge = paint(
-      (SEVERITY_LABELS[severity] ?? severity).padEnd(SEVERITY_BADGE_WIDTH),
+      label.padEnd(SEVERITY_BADGE_WIDTH),
       SEVERITY_COLORS[severity] ?? 37,
     );
     wrap(title, FINDING_INDENT, `    ${badge}  `);
@@ -152,17 +144,17 @@ export function renderScanHistory(
     }
     if (related?.length) {
       lines.push(
-        `              ${accent("↔")} ${related.length} related finding${related.length === 1 ? "" : "s"}, kept separate`,
+        `${" ".repeat(FINDING_INDENT)}${accent("↔")} ${related.length} related finding${related.length === 1 ? "" : "s"}, kept separate`,
       );
       if (showLinkedFindings) {
         for (const relation of related) {
           if (relation["scanId"] !== undefined) {
             lines.push(
-              `                ${strong("RELATED SCAN")} ${accent(clean(relation["scanId"]).slice(0, 8))}`,
+              `${" ".repeat(FINDING_INDENT + 2)}${strong("RELATED SCAN")} ${accent(clean(relation["scanId"]).slice(0, 8))}`,
             );
           }
-          wrap(`↳ ${clean(relation["title"])}`, 18);
-          wrap(clean(relation["reason"]), 20);
+          wrap(`↳ ${clean(relation["title"])}`, FINDING_INDENT + 4);
+          wrap(clean(relation["reason"]), FINDING_INDENT + 6);
         }
       }
     }

@@ -399,44 +399,70 @@ describe("severity badge column", () => {
             { color, columns },
           ),
         );
-        const offsets = severities.map((severity) => {
-          const line = text
-            .split("\n")
-            .find((candidate) => candidate.includes(`Title for ${severity}`))!;
-          return line.indexOf(`Title for ${severity}`);
-        });
-        expect(new Set(offsets).size).toBe(1);
-        // The path line under each badge lines up with the title above it.
-        const path = text
-          .split("\n")
-          .find((candidate) => candidate.includes("informational.ts"))!;
-        expect(path.indexOf("informational.ts")).toBe(offsets[0]!);
+        const lines = text.split("\n");
+        for (const severity of severities) {
+          const title = `Title for ${severity}`;
+          const path = `${severity}.ts`;
+          expect(
+            lines.find((line) => line.includes(title))!.indexOf(title),
+          ).toBe(14);
+          expect(lines.find((line) => line.includes(path))!.indexOf(path)).toBe(
+            14,
+          );
+        }
+        expect(text).toContain("    INFO      Title for informational");
       }
     }
   });
 
-  test("keeps the badge column as wide as its widest label", () => {
-    const text = stripVTControlCharacters(
-      renderScanHistory(
-        {
-          beforeScanId: "before-scan",
-          afterScanId: "after-scan",
-          coverage: { afterCompleteness: "complete" },
-          summary: { new: 1 },
-          findings: [
-            {
-              status: "new",
-              severity: "informational",
-              title: "Informational finding",
-              path: "a.ts",
-            },
-          ],
-        },
-        "compare",
-        { color: false },
-      ),
-    );
-    expect(text).toContain("    INFO      Informational finding");
-    expect(text).not.toContain("INFORMATIONAL  ");
+  test("aligns wrapped titles and nested finding details", () => {
+    for (const color of [false, true]) {
+      const lines = stripVTControlCharacters(
+        renderScanHistory(
+          {
+            scanId: "current-scan",
+            targetPath: "/synthetic/repository",
+            progress: { status: "complete" },
+            findings: [
+              {
+                severity: { level: "informational" },
+                title:
+                  "Informational finding title that continues on the next line",
+                locationPath: "source.ts",
+                matches: [{ scanId: "matched-scan", title: "Matched finding" }],
+                matchReason: "Shared cause",
+                related: [
+                  {
+                    scanId: "related-scan",
+                    title: "Related finding",
+                    reason: "Separate cause",
+                  },
+                ],
+              },
+            ],
+          },
+          "show",
+          { color, columns: 48, showLinkedFindings: true },
+        ),
+      ).split("\n");
+      for (const [text, indent] of [
+        ["Informational finding title that", 14],
+        ["continues on the next line", 14],
+        ["source.ts", 14],
+        ["↔ LINKED FINDINGS", 14],
+        ["MATCHED SCAN", 16],
+        ["↳ Matched finding", 18],
+        ["↔ 1 related finding", 14],
+        ["RELATED SCAN", 16],
+        ["↳ Related finding", 18],
+        ["Separate cause", 20],
+        ["SAME ROOT CAUSE", 16],
+        ["Shared cause", 18],
+      ] as const) {
+        expect(lines.find((line) => line.includes(text))!.indexOf(text)).toBe(
+          indent,
+        );
+      }
+    }
   });
 });
