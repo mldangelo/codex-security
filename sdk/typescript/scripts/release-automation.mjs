@@ -1,7 +1,7 @@
-import { createHash, X509Certificate } from "node:crypto";
+import { X509Certificate, hash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { basename } from "node:path";
-import { pathToFileURL } from "node:url";
+import { isMain } from "./is-main.mjs";
 import { assertExpectedGitHead } from "./package-provenance.mjs";
 
 const packageName = "@openai/codex-security";
@@ -10,6 +10,8 @@ const provenancePredicate = "https://slsa.dev/provenance/v1";
 const publicNpmRegistry = "https://registry.npmjs.org/";
 const githubActionsOidcIssuer = "https://token.actions.githubusercontent.com";
 const fulcioExtensionPrefix = Buffer.from("2b0601040183bf3001", "hex");
+const releaseSummaryStart = "<!-- codex-security-release-summary:start -->";
+const releaseSummaryEnd = "<!-- codex-security-release-summary:end -->";
 
 function stableReleaseTagVersion(tag) {
   if (typeof tag !== "string" || !tag.startsWith("npm-v")) {
@@ -23,17 +25,115 @@ function stableReleaseTagVersion(tag) {
   return version;
 }
 
+export function assertStableVersion(version) {
+  if (typeof version !== "string" || !stableVersion.test(version)) {
+    throw new Error("Release package must have a stable X.Y.Z version.");
+  }
+  return version;
+}
+
 export function releaseVersion(packageJson) {
   if (packageJson?.name !== packageName) {
     throw new Error("Release package must be @openai/codex-security.");
   }
+  return assertStableVersion(packageJson.version);
+}
+
+function hasReviewedText(value) {
+  return !value.includes("\0") && /\S/u.test(value);
+}
+
+export function parseReviewedReleaseNotes(version, notes) {
+  const expectedHeader = `<!-- release-version: ${version} -->`;
+  const normalized =
+    typeof notes === "string" ? notes.replace(/\n+$/u, "") : "";
+  const firstNewline = normalized.indexOf("\n");
+  const summary = normalized.slice(firstNewline + 1);
   if (
-    typeof packageJson.version !== "string" ||
-    !stableVersion.test(packageJson.version)
+    firstNewline === -1 ||
+    normalized.slice(0, firstNewline) !== expectedHeader ||
+    !hasReviewedText(summary)
   ) {
-    throw new Error("Release package must have a stable X.Y.Z version.");
+    throw new Error(
+      `Release notes must start with ${expectedHeader} and include a reviewed summary.`,
+    );
   }
-  return packageJson.version;
+  return summary;
+}
+
+export function extractHistoricalReleaseSummary(notes) {
+  if (typeof notes !== "string") {
+    throw new Error("Existing release notes must be a string.");
+  }
+
+  const markers = [...notes.matchAll(/^[^\r\n]+$/gmu)].filter(
+    ([line]) => line === releaseSummaryStart || line === releaseSummaryEnd,
+  );
+  if (markers.length === 0 || markers[0]?.index !== 0) return null;
+
+  const [startMarker, endMarker] = markers;
+  if (
+    markers.length !== 2 ||
+    startMarker?.[0] !== releaseSummaryStart ||
+    endMarker?.[0] !== releaseSummaryEnd
+  ) {
+    throw new Error("Existing release summary markers are malformed.");
+  }
+
+  const remainder = notes.slice(endMarker.index + endMarker[0].length);
+  if (remainder !== "" && !/^(?:\r?\n){2}/u.test(remainder)) {
+    throw new Error("Existing release summary markers are malformed.");
+  }
+
+  const summary = notes
+    .slice(startMarker.index + startMarker[0].length, endMarker.index)
+    .replace(/^\r?\n/u, "")
+    .replace(/\r?\n$/u, "");
+  if (!hasReviewedText(summary)) {
+    throw new Error("Existing release summary is empty.");
+  }
+  return summary;
+}
+
+export function resolveReleaseSummary(version, taggedNotes, existingNotes) {
+  if (taggedNotes !== undefined) {
+    return parseReviewedReleaseNotes(version, taggedNotes);
+  }
+  if (existingNotes === undefined || existingNotes.length === 0) {
+    return null;
+  }
+  return extractHistoricalReleaseSummary(existingNotes);
+}
+
+export function composeReleaseNotes(generatedNotes, releaseSummary) {
+  if (releaseSummary === null || releaseSummary === "") {
+    return generatedNotes;
+  }
+  return [
+    releaseSummaryStart,
+    releaseSummary,
+    releaseSummaryEnd,
+    "",
+    generatedNotes,
+  ].join("\n");
+}
+
+function releaseNoteFileArguments(args) {
+  const files = {};
+  for (let index = 0; index < args.length; index += 2) {
+    const option = args[index];
+    const file = args[index + 1];
+    if (
+      file === undefined ||
+      (option !== "--tagged-notes-file" &&
+        option !== "--existing-notes-file") ||
+      files[option] !== undefined
+    ) {
+      throw new Error("Invalid release note file arguments.");
+    }
+    files[option] = file;
+  }
+  return files;
 }
 
 export function releaseTagVersion(refType, ref, refName, packageJson) {
@@ -164,14 +264,8 @@ function derChildren(bytes, element) {
   let cursor = element.start;
   while (cursor < element.end) {
     const child = derElement(bytes, cursor, element.end);
-    if (child.end <= cursor) {
-      throw invalidSigningCertificate();
-    }
     children.push(child);
     cursor = child.end;
-  }
-  if (cursor !== element.end) {
-    throw invalidSigningCertificate();
   }
   return children;
 }
@@ -415,8 +509,7 @@ export function verifyPublishedRelease(metadata, archive, expected) {
   assertExpectedGitHead(metadata, expected.gitHead);
 
   const integrity = metadata["dist.integrity"] ?? metadata.dist?.integrity;
-  const expectedIntegrity =
-    "sha512-" + createHash("sha512").update(archive).digest("base64");
+  const expectedIntegrity = "sha512-" + hash("sha512", archive, "base64");
   if (integrity !== expectedIntegrity) {
     throw new Error(
       "Published npm integrity must match the verified release artifact.",
@@ -433,7 +526,7 @@ export function verifyPublishedRelease(metadata, archive, expected) {
     version,
     gitHead: expected.gitHead,
     integrity: expectedIntegrity,
-    sha256: createHash("sha256").update(archive).digest("hex"),
+    sha256: hash("sha256", archive),
   };
 }
 
@@ -444,7 +537,7 @@ export function verifyGitHubPublishedRelease(
   provenance,
 ) {
   const version = releaseVersion(metadata);
-  const sha512 = createHash("sha512").update(archive).digest("hex");
+  const sha512 = hash("sha512", archive);
   if (
     provenance?.version !== version ||
     provenance.gitHead !== expected.gitHead ||
@@ -465,6 +558,28 @@ export function verifyGitHubPublishedRelease(
   }
 
   return verifyPublishedRelease(metadata, archive, expected);
+}
+
+function readProvenance(verified) {
+  const provenance = Array.isArray(verified.attestationBundles)
+    ? verified.attestationBundles.find(
+        (candidate) => candidate?.predicateType === provenancePredicate,
+      )
+    : undefined;
+  const encodedStatement = provenance?.bundle?.dsseEnvelope?.payload;
+  if (typeof encodedStatement !== "string") {
+    throw new Error("The verified SLSA provenance bundle is missing.");
+  }
+
+  let statement;
+  try {
+    statement = JSON.parse(
+      Buffer.from(encodedStatement, "base64").toString("utf8"),
+    );
+  } catch {
+    throw new Error("The verified SLSA provenance statement is invalid.");
+  }
+  return { provenance, statement };
 }
 
 export function verifySignatureAudit(report, archive, expected) {
@@ -512,24 +627,7 @@ export function verifySignatureAudit(report, archive, expected) {
     throw new Error("The verified npm package must have SLSA v1 provenance.");
   }
 
-  const provenance = Array.isArray(verified.attestationBundles)
-    ? verified.attestationBundles.find(
-        (candidate) => candidate?.predicateType === provenancePredicate,
-      )
-    : undefined;
-  const encodedStatement = provenance?.bundle?.dsseEnvelope?.payload;
-  if (typeof encodedStatement !== "string") {
-    throw new Error("The verified SLSA provenance bundle is missing.");
-  }
-
-  let statement;
-  try {
-    statement = JSON.parse(
-      Buffer.from(encodedStatement, "base64").toString("utf8"),
-    );
-  } catch {
-    throw new Error("The verified SLSA provenance statement is invalid.");
-  }
+  const { provenance, statement } = readProvenance(verified);
   if (
     statement?._type !== "https://in-toto.io/Statement/v1" ||
     statement.predicateType !== provenancePredicate
@@ -537,7 +635,7 @@ export function verifySignatureAudit(report, archive, expected) {
     throw new Error("The verified SLSA provenance statement is invalid.");
   }
 
-  const sha512 = createHash("sha512").update(archive).digest("hex");
+  const sha512 = hash("sha512", archive);
   const expectedSubject = `pkg:npm/%40openai/codex-security@${version}`;
   if (
     !Array.isArray(statement.subject) ||
@@ -652,24 +750,7 @@ export function verifyRecoveredSignatureAudit(report, archive, expected) {
     );
   }
 
-  const provenance = Array.isArray(verified.attestationBundles)
-    ? verified.attestationBundles.find(
-        (candidate) => candidate?.predicateType === provenancePredicate,
-      )
-    : undefined;
-  const encodedStatement = provenance?.bundle?.dsseEnvelope?.payload;
-  if (typeof encodedStatement !== "string") {
-    throw new Error("The verified SLSA provenance bundle is missing.");
-  }
-
-  let statement;
-  try {
-    statement = JSON.parse(
-      Buffer.from(encodedStatement, "base64").toString("utf8"),
-    );
-  } catch {
-    throw new Error("The verified SLSA provenance statement is invalid.");
-  }
+  const { statement } = readProvenance(verified);
 
   const prefix = `https://github.com/${expected.repository}/actions/runs/`;
   const invocation = statement?.predicate?.runDetails?.metadata?.invocationId;
@@ -708,8 +789,7 @@ export function verifyGitHubRelease(
     throw new Error("Existing GitHub Release must be published and stable.");
   }
 
-  const expectedDigest =
-    "sha256:" + createHash("sha256").update(archive).digest("hex");
+  const expectedDigest = "sha256:" + hash("sha256", archive);
   const asset = Array.isArray(release.assets)
     ? release.assets.find((candidate) => candidate?.name === assetName)
     : undefined;
@@ -717,8 +797,7 @@ export function verifyGitHubRelease(
   const downloadedDigest =
     downloadedArchive === undefined
       ? undefined
-      : "sha256:" +
-        createHash("sha256").update(downloadedArchive).digest("hex");
+      : "sha256:" + hash("sha256", downloadedArchive);
   if (
     asset === undefined ||
     (publishedDigest != null && publishedDigest !== expectedDigest) ||
@@ -786,6 +865,35 @@ function main() {
     return;
   }
 
+  if (command === "validate-release-notes" && process.argv.length === 5) {
+    const notes = readFileSync(process.argv[4], "utf8");
+    process.stdout.write(parseReviewedReleaseNotes(process.argv[3], notes));
+    return;
+  }
+
+  if (command === "compose-release-notes" && process.argv.length >= 5) {
+    const version = process.argv[3];
+    const generatedNotes = readFileSync(process.argv[4], "utf8");
+    const normalizedGeneratedNotes = generatedNotes.replace(/(?:\r?\n)+$/u, "");
+    if (normalizedGeneratedNotes.length === 0) {
+      throw new Error("Generated GitHub release notes must not be empty.");
+    }
+    const files = releaseNoteFileArguments(process.argv.slice(5));
+    const taggedNotes =
+      files["--tagged-notes-file"] === undefined
+        ? undefined
+        : readFileSync(files["--tagged-notes-file"], "utf8");
+    const existingNotes =
+      files["--existing-notes-file"] === undefined
+        ? undefined
+        : readFileSync(files["--existing-notes-file"], "utf8");
+    const summary = resolveReleaseSummary(version, taggedNotes, existingNotes);
+    process.stdout.write(
+      composeReleaseNotes(normalizedGeneratedNotes, summary),
+    );
+    return;
+  }
+
   if (command === "release-history" && process.argv.length === 4) {
     const registryVersions = JSON.parse(
       process.env.CODEX_SECURITY_PUBLISHED_NPM_VERSIONS ?? "[]",
@@ -812,24 +920,25 @@ function main() {
     return;
   }
 
-  if (command === "verify-publication" && process.argv.length === 6) {
+  if (
+    (command === "verify-publication" && process.argv.length === 6) ||
+    (command === "verify-github-publication" && process.argv.length === 8) ||
+    (command === "verify-provenance" && process.argv.length === 8) ||
+    (command === "verify-recovered-provenance" && process.argv.length === 7)
+  ) {
     const metadata = JSON.parse(readFileSync(0, "utf8"));
     const archive = readFileSync(process.argv[3]);
-    const verified = verifyPublishedRelease(metadata, archive, {
-      version: process.argv[4],
-      gitHead: process.argv[5],
-    });
-    console.log(JSON.stringify(verified));
-    return;
-  }
-
-  if (command === "verify-github-publication" && process.argv.length === 8) {
-    const metadata = JSON.parse(readFileSync(0, "utf8"));
-    const archive = readFileSync(process.argv[3]);
-    const provenance = JSON.parse(
-      process.env.CODEX_SECURITY_VERIFIED_PROVENANCE ?? "null",
-    );
-    const verified = verifyGitHubPublishedRelease(
+    const provenance =
+      command === "verify-github-publication"
+        ? JSON.parse(process.env.CODEX_SECURITY_VERIFIED_PROVENANCE ?? "null")
+        : undefined;
+    const verify = {
+      "verify-publication": verifyPublishedRelease,
+      "verify-github-publication": verifyGitHubPublishedRelease,
+      "verify-provenance": verifySignatureAudit,
+      "verify-recovered-provenance": verifyRecoveredSignatureAudit,
+    }[command];
+    const verified = verify(
       metadata,
       archive,
       {
@@ -840,31 +949,6 @@ function main() {
       },
       provenance,
     );
-    console.log(JSON.stringify(verified));
-    return;
-  }
-
-  if (command === "verify-provenance" && process.argv.length === 8) {
-    const report = JSON.parse(readFileSync(0, "utf8"));
-    const archive = readFileSync(process.argv[3]);
-    const verified = verifySignatureAudit(report, archive, {
-      version: process.argv[4],
-      gitHead: process.argv[5],
-      repository: process.argv[6],
-      runId: process.argv[7],
-    });
-    console.log(JSON.stringify(verified));
-    return;
-  }
-
-  if (command === "verify-recovered-provenance" && process.argv.length === 7) {
-    const report = JSON.parse(readFileSync(0, "utf8"));
-    const archive = readFileSync(process.argv[3]);
-    const verified = verifyRecoveredSignatureAudit(report, archive, {
-      version: process.argv[4],
-      gitHead: process.argv[5],
-      repository: process.argv[6],
-    });
     console.log(JSON.stringify(verified));
     return;
   }
@@ -896,6 +980,10 @@ function main() {
       "require-published-increase <version> " +
       "(published npm versions JSON from stdin), " +
       "release-mode <version> (published npm versions JSON from stdin), " +
+      "validate-release-notes <version> <release-notes-file>, " +
+      "compose-release-notes <version> <generated-notes-file> " +
+      "[--tagged-notes-file <file>] " +
+      "[--existing-notes-file <file>], " +
       "release-history <tag>, " +
       "verify-publication <archive> <version> <git-head> " +
       "(package metadata JSON from stdin), " +
@@ -911,9 +999,6 @@ function main() {
   );
 }
 
-if (
-  process.argv[1] !== undefined &&
-  import.meta.url === pathToFileURL(process.argv[1]).href
-) {
+if (isMain(import.meta.url)) {
   main();
 }
