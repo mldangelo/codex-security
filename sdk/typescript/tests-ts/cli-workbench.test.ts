@@ -2,6 +2,7 @@ import { codexWithRun, jsonCodex } from "./support/codex.js";
 import { mkdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import * as fs from "node:fs/promises";
 import { join, resolve } from "node:path";
+import { Writable } from "node:stream";
 import { describe, expect, test, mock, spyOn } from "bun:test";
 import type { CodexSecurityConfig, JsonObject } from "../src/index.js";
 import { DiffTarget, type ScanOptions } from "../src/index.js";
@@ -1208,6 +1209,90 @@ describe("CLI workbench", () => {
       expect(stderr.text()).toContain(
         "conflicting confirmed and uncertain findings",
       );
+    },
+  );
+
+  test.each(["mixed", "all-failed"] as const)(
+    "preserves %s matching outcomes when warning output throws",
+    async (outcome) => {
+      const saved: string[] = [];
+      const matched: string[] = [];
+      const warnings: string[] = [];
+      let diagnostic = "";
+      const failure = new Error("Original synthetic matching failure");
+      const loggingFailure = new Error("Synthetic warning writer failure");
+      const stderr = new Writable({
+        write(chunk, _encoding, callback) {
+          diagnostic += String(chunk);
+          callback();
+        },
+      });
+      const write = stderr.write.bind(stderr);
+      stderr.write = (
+        chunk: unknown,
+        encodingOrCallback?: BufferEncoding | ((error?: Error | null) => void),
+        callback?: (error?: Error | null) => void,
+      ) => {
+        const message = String(chunk);
+        if (message.startsWith("codex-security: warning:")) {
+          warnings.push(message);
+          throw loggingFailure;
+        }
+        return typeof encodingOrCallback === "string"
+          ? write(chunk, encodingOrCallback, callback)
+          : write(chunk, encodingOrCallback);
+      };
+      const { stdout } = createCliTest(main);
+      try {
+        const exitCode = await main(
+          ["scans", "match", "--all", "--json"],
+          stdout.stream,
+          stderr,
+          dependencies({
+            onWorkbench: (args): JsonObject => {
+              if (args[0] === "list-unmatched-scan-pairs")
+                return {
+                  batches: ["first", "failed", "last"].map((id) => ({
+                    afterScanId: id,
+                    afterFindings: [{ occurrenceId: id }],
+                    beforeScans: [
+                      {
+                        scanId: `before-${id}`,
+                        findings: [{ occurrenceId: `before-${id}` }],
+                      },
+                    ],
+                  })),
+                };
+              saved.push(args[4]!);
+              return {};
+            },
+            onMatch: async (input) => {
+              const id = input.after[0]!.occurrenceId;
+              matched.push(id);
+              if (outcome === "all-failed" || id === "failed") throw failure;
+              return { matches: [], uncertain: [] };
+            },
+          }),
+        );
+        expect(matched).toEqual(["first", "failed", "last"]);
+        expect(warnings).toHaveLength(outcome === "all-failed" ? 3 : 1);
+        expect(diagnostic).not.toContain(loggingFailure.message);
+        if (outcome === "mixed") {
+          expect(exitCode).toBe(0);
+          expect(saved).toEqual(["first", "last"]);
+          expect(JSON.parse(stdout.text())).toMatchObject({
+            matchedPairs: 2,
+            unmatchedBatches: 1,
+          });
+        } else {
+          expect(exitCode).toBe(2);
+          expect(saved).toEqual([]);
+          expect(stdout.text()).toBe("");
+          expect(diagnostic).toContain(failure.message);
+        }
+      } finally {
+        stderr.destroy();
+      }
     },
   );
 

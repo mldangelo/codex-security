@@ -2502,7 +2502,13 @@ export async function main(
                   options.force,
                   matchingOptions,
                   (warning) => {
-                    errorOutput.write(`codex-security: warning: ${warning}\n`);
+                    try {
+                      errorOutput.write(
+                        `codex-security: warning: ${warning}\n`,
+                      );
+                    } catch {
+                      // Optional warnings must not stop the remaining batches.
+                    }
                   },
                 ),
               options,
