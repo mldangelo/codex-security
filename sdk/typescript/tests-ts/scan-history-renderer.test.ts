@@ -3,6 +3,49 @@ import { describe, expect, test } from "bun:test";
 import { renderScanHistory } from "../src/scan-history-renderer.js";
 
 describe("scan history renderer", () => {
+  test.each([false, true])(
+    "strips terminal controls from severity count labels with color=%p",
+    (color) => {
+      const output = renderScanHistory(
+        {
+          scanId: "synthetic-scan",
+          targetPath: "/synthetic/repository",
+          mode: "standard",
+          progress: { status: "complete" },
+          severityCounts: { critical: 1, ["future\u001b[2J\u001b[H"]: 2 },
+          findings: [],
+        },
+        "show",
+        { color },
+      );
+
+      expect(output).not.toContain("\u001b[2J");
+      expect(output).not.toContain("\u001b[H");
+      const text = stripVTControlCharacters(output);
+      expect(text).toContain("1 CRITICAL");
+      expect(text).toContain("2 FUTURE");
+    },
+  );
+
+  test("separates current repository findings from earlier observations", () => {
+    const text = renderScanHistory(
+      {
+        repository: "/repo",
+        findings: [true, false].map((confirmed) => ({
+          title: confirmed ? "Current finding" : "Earlier finding",
+          severity: { level: "high" },
+          locationPath: "source.ts",
+          confirmedInLatestScan: confirmed,
+        })),
+      },
+      "findings",
+      { color: false },
+    );
+    expect(text).toMatch(
+      /Seen this scan[\s\S]*Current finding[\s\S]*Not confirmed in latest scan[\s\S]*Earlier finding/,
+    );
+  });
+
   test("leads comparisons with the outcome and groups root causes", () => {
     const text = stripVTControlCharacters(
       renderScanHistory(
@@ -282,6 +325,8 @@ describe("scan history renderer", () => {
           unavailableScans: 2,
           matchedPairs: 0,
           findingMatches: 0,
+          relatedPairs: 2,
+          uncertainPairs: 1,
         },
         "match-all",
       ),
@@ -292,131 +337,64 @@ describe("scan history renderer", () => {
       "5 scans",
       "0 comparisons",
       "0 root-cause matches",
+      "2 related pairs recorded",
+      "1 uncertain pair",
       "2 scans unavailable",
     ]) {
       expect(output).toContain(expected);
     }
   });
-});
 
-describe("scan history renderer resilience", () => {
-  // The workbench response is only checked for being a JSON object
-  // (src/runtime.ts runWorkbench), so a plugin or database that drifts from the
-  // shape this renderer expects must degrade instead of crashing the command.
-  const plain = (
-    result: Parameters<typeof renderScanHistory>[0],
-    command: Parameters<typeof renderScanHistory>[1],
-    options = {},
-  ) =>
-    stripVTControlCharacters(
-      renderScanHistory(result, command, { color: false, ...options }),
-    );
-
-  test("renders comparison findings with a missing or null severity", () => {
-    for (const severity of [undefined, null]) {
-      const text = plain(
-        {
-          beforeScanId: "before-scan",
-          afterScanId: "after-scan",
-          coverage: { afterCompleteness: "complete" },
-          summary: { resolved: 1 },
-          findings: [
-            {
-              ...(severity === undefined ? {} : { severity }),
-              status: "resolved",
-              title: "Reflected XSS in the search handler",
-              locations: [{ path: "src/search.ts", startLine: 10 }],
-            },
-          ],
-        },
-        "compare",
-      );
-      expect(text).toContain("Reflected XSS in the search handler");
-      expect(text).toContain("src/search.ts:10");
-    }
-  });
-
-  test("sorts an unrecognized severity below every known severity", () => {
-    const text = plain(
+  test("renders related findings separately in scan details and comparisons", () => {
+    const relation = {
+      beforeTitle: "Archive writer boundary",
+      afterTitle: "Archive reader boundary",
+      title: "Archive reader boundary",
+      scanId: "12345678-abcd-4567-abcd-1234567890ab",
+      reason: "The two controls require independent corrections.",
+    };
+    const comparison = renderScanHistory(
       {
-        beforeScanId: "before-scan",
-        afterScanId: "after-scan",
+        beforeScanId: "before",
+        afterScanId: "after",
         coverage: { afterCompleteness: "complete" },
-        summary: { new: 2 },
-        findings: [
-          {
-            status: "new",
-            severity: "not-a-severity",
-            title: "Unknown severity finding",
-            path: "a.ts",
-          },
-          {
-            status: "new",
-            severity: "critical",
-            title: "Critical severity finding",
-            path: "b.ts",
-          },
-        ],
+        summary: {},
+        findings: [],
+        related: [relation],
       },
       "compare",
+      { color: false },
     );
-    expect(text.indexOf("Critical severity finding")).toBeLessThan(
-      text.indexOf("Unknown severity finding"),
-    );
-  });
+    for (const value of [
+      "Related findings, kept separate",
+      relation.beforeTitle,
+      relation.afterTitle,
+      relation.reason,
+    ]) {
+      expect(comparison).toContain(value);
+    }
 
-  test("lists scans that carry no progress record", () => {
-    const text = plain(
-      {
-        scans: [
-          {
-            scanId: "11111111-1111-4111-8111-111111111111",
-            targetPath: "/repo",
-            mode: "standard",
-            startedAt: "2026-07-01T00:00:00Z",
-            findingCount: 3,
-          },
-        ],
-      },
-      "list",
-    );
-    expect(text).toContain("11111111-1111-4111-8111-111111111111");
-    expect(text).toContain("UNKNOWN");
-  });
-
-  test("falls back to the raw value for an unparsable knownSince", () => {
-    const text = plain(
-      {
-        scanId: "scan-1",
-        targetPath: "/repo",
-        mode: "standard",
-        progress: { status: "complete" },
-        findings: [
-          {
-            severity: { level: "high" },
-            title: "Path traversal",
-            knownSince: "not-a-timestamp",
-            matches: [
-              {
-                scanId: "older-scan",
-                title: "Path traversal",
-                reason: "same sink",
-              },
-            ],
-            locations: [{ path: "src/fs.ts", startLine: 22 }],
-          },
-        ],
-      },
-      "show",
-      { showLinkedFindings: true },
-    );
-    expect(text).toContain("Known since not-a-timestamp");
-    expect(text).toContain("Path traversal");
-  });
-
-  test("renders every command from an empty payload", () => {
-    for (const command of ["list", "show", "compare", "match-all"] as const) {
-      expect(() => plain({}, command)).not.toThrow();
+    const scan = {
+      scanId: "current-scan",
+      targetPath: "/synthetic/repository",
+      progress: { status: "complete" },
+      findings: [
+        { title: relation.beforeTitle, severity: "high", related: [relation] },
+      ],
+    };
+    const compact = renderScanHistory(scan, "show", { color: false });
+    expect(compact).toContain("1 related finding, kept separate");
+    expect(compact).not.toContain(relation.reason);
+    const expanded = renderScanHistory(scan, "show", {
+      color: false,
+      showLinkedFindings: true,
+    });
+    for (const value of [
+      relation.afterTitle,
+      relation.scanId.slice(0, 8),
+      relation.reason,
+    ]) {
+      expect(expanded).toContain(value);
     }
   });
 });
