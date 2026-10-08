@@ -1102,7 +1102,10 @@ describe("CLI workbench", () => {
         afterScanId: `after-${id}`,
         afterFindings: [
           { occurrenceId: `after-${id}`, findingId: `finding-after-${id}` },
-          { occurrenceId: `related-after-${id}` },
+          {
+            occurrenceId: `related-after-${id}`,
+            findingId: `related-after-${id}`,
+          },
         ],
         beforeScans: [
           {
@@ -1112,7 +1115,10 @@ describe("CLI workbench", () => {
                 occurrenceId: `before-${id}`,
                 findingId: `finding-before-${id}`,
               },
-              { occurrenceId: `related-before-${id}` },
+              {
+                occurrenceId: `related-before-${id}`,
+                findingId: `related-before-${id}`,
+              },
             ],
           },
         ],
