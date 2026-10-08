@@ -2495,23 +2495,25 @@ export async function main(
       async run({ args, format, options }) {
         if (options.all) {
           return presentHistory(
-            await runMatching(
-              (matchingOptions) =>
-                matchAllScans(
-                  dependencies,
-                  options.force,
-                  matchingOptions,
-                  (warning) => {
-                    try {
-                      errorOutput.write(
-                        `codex-security: warning: ${warning}\n`,
-                      );
-                    } catch {
-                      // Optional warnings must not stop the remaining batches.
-                    }
-                  },
-                ),
-              options,
+            await withTerminalErrorsHandled(errorOutput, () =>
+              runMatching(
+                (matchingOptions) =>
+                  matchAllScans(
+                    dependencies,
+                    options.force,
+                    matchingOptions,
+                    (warning) => {
+                      try {
+                        errorOutput.write(
+                          `codex-security: warning: ${warning}\n`,
+                        );
+                      } catch {
+                        // Optional warnings must not stop the remaining batches.
+                      }
+                    },
+                  ),
+                options,
+              ),
             ),
             "match-all",
             format,

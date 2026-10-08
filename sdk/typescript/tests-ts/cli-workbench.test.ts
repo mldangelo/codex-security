@@ -3,6 +3,7 @@ import { mkdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import * as fs from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { Writable } from "node:stream";
+import { setImmediate as nextTurn } from "node:timers/promises";
 import { describe, expect, test, mock, spyOn } from "bun:test";
 import type { CodexSecurityConfig, JsonObject } from "../src/index.js";
 import { DiffTarget, type ScanOptions } from "../src/index.js";
@@ -20,6 +21,7 @@ import {
 } from "./cli-fixtures.js";
 import { temporaryDirectory } from "./support/temporary-directories.js";
 import { rejecting, throwing } from "./support/errors.js";
+import { runTestInSubprocess } from "./support/test-subprocess.js";
 import {
   createCliTest,
   captureCli,
@@ -1289,6 +1291,133 @@ describe("CLI workbench", () => {
           expect(saved).toEqual([]);
           expect(stdout.text()).toBe("");
           expect(diagnostic).toContain(failure.message);
+        }
+      } finally {
+        stderr.destroy();
+      }
+    },
+  );
+
+  test.each([
+    "normal",
+    "mixed",
+    "last-failed",
+    "all-failed",
+    "save-failure",
+    "canceled",
+  ] as const)(
+    "preserves %s matching with asynchronous warning-stream errors",
+    async (outcome) => {
+      const name = `preserves ${outcome} matching with asynchronous warning-stream errors`;
+      if (runTestInSubprocess(import.meta.path, name)) return;
+      const signals = new FakeSignals();
+      const batchIds =
+        outcome === "all-failed" ? ["warning"] : ["first", "warning", "last"];
+      const matched: string[] = [];
+      const saved: string[] = [];
+      const saveAttempts: string[] = [];
+      let warningWrites = 0;
+      const stderr = new Writable({
+        write(chunk, _encoding, callback) {
+          if (String(chunk).startsWith("codex-security: warning:")) {
+            warningWrites += 1;
+            setImmediate(() =>
+              callback(
+                Object.assign(new Error("Synthetic closed warning pipe"), {
+                  code: "EPIPE",
+                }),
+              ),
+            );
+          } else callback();
+        },
+      });
+      const { stdout } = createCliTest(main);
+      try {
+        const exitCode = await main(
+          ["scans", "match", "--all", "--json"],
+          stdout.stream,
+          stderr,
+          dependencies({
+            signals,
+            onWorkbench: (args): JsonObject => {
+              if (args[0] === "list-unmatched-scan-pairs")
+                return {
+                  batches: batchIds.map((id) => ({
+                    afterScanId: id,
+                    afterFindings: [{ occurrenceId: id }],
+                    beforeScans: [
+                      {
+                        scanId: `before-${id}`,
+                        findings: [{ occurrenceId: `before-${id}` }],
+                      },
+                    ],
+                  })),
+                };
+              const id = args[4]!;
+              saveAttempts.push(id);
+              if (outcome === "save-failure" && id === "last")
+                throw new Error("Synthetic fatal comparison save failure");
+              saved.push(id);
+              return {};
+            },
+            onMatch: async (input) => {
+              await nextTurn();
+              const id = input.after[0]!.occurrenceId;
+              matched.push(id);
+              if (
+                outcome === "all-failed" ||
+                (outcome === "last-failed"
+                  ? id === "last"
+                  : outcome !== "normal" && id === "warning")
+              )
+                throw new Error("Synthetic matching failure");
+              if (outcome === "canceled" && id === "last")
+                signals.emit("SIGINT");
+              return { matches: [], uncertain: [] };
+            },
+          }),
+        );
+        await nextTurn();
+        expect(matched).toEqual(batchIds);
+        expect(warningWrites).toBe(outcome === "normal" ? 0 : 1);
+        expect(stderr.listenerCount("error")).toBe(0);
+        expect(
+          [...signals.listeners.values()].every(
+            (listeners) => listeners.size === 0,
+          ),
+        ).toBe(true);
+        if (
+          outcome === "normal" ||
+          outcome === "mixed" ||
+          outcome === "last-failed"
+        ) {
+          expect(exitCode).toBe(0);
+          const result = JSON.parse(stdout.text());
+          if (outcome === "normal") {
+            expect(saved).toEqual(["first", "warning", "last"]);
+            expect(result).not.toHaveProperty("unmatchedBatches");
+          } else {
+            expect(saved).toEqual(
+              outcome === "last-failed"
+                ? ["first", "warning"]
+                : ["first", "last"],
+            );
+            expect(result).toMatchObject({
+              matchedPairs: 2,
+              unmatchedBatches: 1,
+            });
+          }
+        } else {
+          expect(exitCode).toBe(outcome === "canceled" ? 130 : 2);
+          expect(stdout.text()).toBe("");
+          expect(saved).toEqual(outcome === "all-failed" ? [] : ["first"]);
+          expect(saveAttempts).toEqual(
+            outcome === "save-failure"
+              ? ["first", "last"]
+              : outcome === "canceled"
+                ? ["first"]
+                : [],
+          );
         }
       } finally {
         stderr.destroy();
